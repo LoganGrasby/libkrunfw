@@ -1,0 +1,57 @@
+From: Logan Grasby <logan@smol.ai>
+Date: Thu, 27 Feb 2026 00:00:00 +0000
+Subject: [PATCH] x86/apic: Skip LAPIC timer calibration on KVM guests
+
+KVM emulates the LAPIC with a fixed bus frequency of 1 GHz (1ns per
+cycle, set via APIC_BUS_CYCLE_NS_DEFAULT in the host KVM module). The
+guest calibrate_APIC_clock() runs a ~200ms busy-wait loop to measure
+this frequency, which is entirely unnecessary since the value is fixed
+and known.
+
+On AMD CPUs that lack X86_FEATURE_TSC_DEADLINE_TIMER (Zen 1/2/3), this
+calibration cannot be skipped by any existing early-return path, adding
+200ms+ to every VM boot.
+
+When running under KVM, pre-compute lapic_timer_period from the known
+1 GHz bus frequency. The existing early return via
+lapic_init_clockevent() then fires, skipping the calibration loop while
+keeping the LAPIC timer fully functional.
+
+Tested on AMD Ryzen 5 3600 (Zen 2) with KVM:
+  - Boot time: 351ms -> 147ms (~58% reduction)
+  - Timer accuracy: no regression at any vCPU count (1/2/4)
+  - Scheduler fairness: no regression
+  - No kernel warnings
+
+Signed-off-by: Logan Grasby <logan@smol.ai>
+---
+ arch/x86/kernel/apic/apic.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/arch/x86/kernel/apic/apic.c b/arch/x86/kernel/apic/apic.c
+index 373503838549..a1b2c3d4e5f6 100644
+--- a/arch/x86/kernel/apic/apic.c
++++ b/arch/x86/kernel/apic/apic.c
+@@ -61,6 +61,7 @@
+ #include <asm/mce.h>
+ #include <asm/tsc.h>
+ #include <asm/hypervisor.h>
++#include <asm/kvm_para.h>
+ #include <asm/cpu_device_id.h>
+ #include <asm/intel-family.h>
+ #include <asm/irq_regs.h>
+@@ -798,6 +799,14 @@ static int __init calibrate_APIC_clock(void)
+ 	if (boot_cpu_has(X86_FEATURE_TSC_DEADLINE_TIMER))
+ 		return 0;
+
++	/*
++	 * KVM emulates the LAPIC with a fixed 1 GHz bus frequency
++	 * (APIC_BUS_CYCLE_NS_DEFAULT = 1). Pre-compute the timer period
++	 * (bus cycles per tick) to skip the ~200ms calibration busy-wait.
++	 */
++	if (kvm_para_available() && !lapic_timer_period)
++		lapic_timer_period = 1000000000UL / HZ;
++
+ 	/*
+ 	 * Check if lapic timer has already been calibrated by platform
+ 	 * specific routine, such as tsc calibration code. If so just fill
